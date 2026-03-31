@@ -6,6 +6,9 @@ from vllm.forward_context import get_forward_context
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.parallel_state import get_fc3_quant_x_group
 
+import torch_npu
+from vllm.config import get_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_gather
 
 def fc3_all_gather_and_maybe_unpad_impl(
     x: torch.Tensor,
@@ -46,3 +49,18 @@ def all_gather_async(
         output_size = (input_size[0] * group.world_size,) + input_size[1:]
         output = torch.empty(output_size, dtype=input.dtype, device=input.device)
     return output, dist.all_gather_into_tensor(output, input, group=group.device_group, async_op=async_op)
+
+def dict_tensor_model_parallel_all_gather(input: torch.Tensor, dim=-1):
+    vllm_config = get_current_vllm_config()
+    quant_type = getattr(vllm_config.model_config.hf_text_config, "moe_quantize", getattr(vllm_config.model_config.hf_text_config, "quantize", None))
+    if quant_type != "w8a8_dynamic":
+        return
+    x_int8, pertoken_scale = torch_npu.npu_dynamic_quant(input)
+    input_ = {"x_int8": x_int8, "pertoken_scale": pertoken_scale}
+    if isinstance(input_, dict):
+        for key in sorted(input_.keys()):
+            value = input_[key]
+            if isinstance(value, torch.Tensor):
+                input_[key] = tensor_model_parallel_all_gather(value, dim=dim)
+        input_["dtype_before_quant"]=input.dtype
+        return input_

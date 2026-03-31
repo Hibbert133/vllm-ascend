@@ -78,7 +78,11 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+        if not isinstance(x, dict):
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+            output_dtype = x.dtype
+        else:
+            quantized_x, pertoken_scale, output_dtype = x["x_int8"], x["pertoken_scale"], x["dtype_before_quant"]
         need_unsqz = False
         if pertoken_scale.dim() == 2:
             need_unsqz = True
@@ -90,7 +94,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             layer.weight_scale,
             pertoken_scale=pertoken_scale,
             bias=bias,
-            output_dtype=x.dtype,
+            output_dtype=output_dtype,
         )
         if need_unsqz:
             output = output.unsqueeze(dim=1)
