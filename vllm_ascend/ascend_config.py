@@ -147,7 +147,8 @@ class AscendConfig:
                 raise NotImplementedError(
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
-
+        self.static_kernels = additional_config.get("static_kernels", [])
+        
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
         # Disable Sparse C8 for A5

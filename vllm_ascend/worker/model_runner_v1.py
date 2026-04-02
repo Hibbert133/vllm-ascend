@@ -150,6 +150,9 @@ else:
 
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+import torch_npu
+from contextlib import ExitStack, contextmanager
+from vllm_ascend.compilation.npu_static_kernel_compiler import StaticKernelCompiler
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -425,9 +428,48 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
 
+        logger.info(f"【ascend config】{self.ascend_config.__dict__}")
+        self.static_kernels = self.ascend_config.static_kernels
+
     @property
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
+
+    def static_compile(self):
+        if not self.static_kernels:
+            logger.info(f"\t {self.static_kernels}")
+            return
+        max_num_tokens = (self.scheduler_config.max_num_seqs * self.uniform_decode_query_len)
+        logger.info(f"\t{self.cudagraph_batch_sizes=}, {self.compilation_config.cudagraph_capture_sizes=}, {max_num_tokens=}, {self.uniform_decode_query_len}")
+        decode_cudagraph_batch_sizes = [
+            x
+            for x in self.compilation_config.cudagraph_capture_sizes
+            if max_num_tokens >= x >= self.uniform_decode_query_len
+        ]
+        if not decode_cudagraph_batch_sizes:
+            return
+        
+        compilation_cases_decode = list(reversed(decode_cudagraph_batch_sizes))
+        for num_tokens in compilation_cases_decode:
+            self._dummy_run(num_tokens,
+                            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                            force_attention=True,
+                            uniform_decode=True)
+            torch.npu.synchronize()
+        with ExitStack() as stack:
+            stack.enter_context(StaticKernelCompiler(self.vllm_config, self.static_kernels))
+            for num_tokens in compilation_cases_decode:
+                self._dummy_run(num_tokens,
+                                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                force_attention=True,
+                                uniform_decode=True)
+                torch.npu.synchronize()
+        for num_tokens in compilation_cases_decode:
+            self._dummy_run(num_tokens,
+                            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                            force_attention=True,
+                            uniform_decode=True)
+            torch.npu.synchronize()
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -3327,6 +3369,7 @@ class NPUModelRunner(GPUModelRunner):
                 set_draft_graph_params(self.cudagraph_batch_sizes)
 
     def capture_model(self) -> None:
+        self.static_compile()
         gpu_model_runner_cls = next((cls for cls in self.__class__.__mro__ if cls.__name__ == "GPUModelRunner"), None)
         if gpu_model_runner_cls is None:
             raise TypeError("Could not find GPUModelRunner in the MRO. The class hierarchy may have changed.")
