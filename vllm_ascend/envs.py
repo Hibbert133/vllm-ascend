@@ -110,6 +110,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    "ALIGN_MAMBA_PREFIX_CACHING_LENGTH": lambda: int(os.getenv("ALIGN_MAMBA_PREFIX_CACHING_LENGTH", "0")),
+    "VLLM_ASCEND_KV_CACHE_PAD_FACTOR": lambda: int(os.getenv("VLLM_ASCEND_KV_CACHE_PAD_FACTOR", "1"))
 }
 
 # end-env-vars-definition
