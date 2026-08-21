@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.ops import gdn as ascend_gdn
 from vllm_ascend.ops import gdn_attn_builder as ascend_gdn_attn_builder
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.ops.gdn_attn_builder import (
@@ -298,6 +299,67 @@ def _patch_missing_runtime_cdiv(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_ascend_gdn_attention_uses_ascend_backend():
     assert AscendGatedDeltaNetAttention.get_attn_backend(object()) is AscendGDNAttentionBackend
     assert AscendGDNAttentionBackend.get_builder_cls() is AscendGDNAttentionMetadataBuilder
+
+
+def test_fused_chunk_gated_delta_rule_adapts_v023_layout(monkeypatch):
+    total_tokens = 7
+    num_key_heads = 2
+    num_value_heads = 4
+    head_dim = 8
+    num_sequences = 2
+    captured = {}
+
+    def fake_fused_chunk(query, key, value, **kwargs):
+        captured.update(query=query, key=key, value=value, **kwargs)
+        output = torch.empty_like(value)
+        final_state = torch.empty_like(kwargs["initial_state"])
+        return output, final_state
+
+    monkeypatch.setattr(ascend_gdn, "l2norm_fwd", lambda tensor: tensor)
+    monkeypatch.setattr(ascend_gdn.torch_npu, "npu_chunk_gated_delta_rule", fake_fused_chunk)
+
+    query = torch.randn(1, total_tokens, num_key_heads, head_dim, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    value = torch.randn(1, total_tokens, num_value_heads, head_dim, dtype=torch.bfloat16)
+    g = torch.randn(1, total_tokens, num_value_heads, dtype=torch.float32)
+    beta = torch.rand(1, total_tokens, num_value_heads, dtype=torch.float32)
+    initial_state = torch.randn(
+        num_sequences,
+        num_value_heads,
+        head_dim,
+        head_dim,
+        dtype=torch.float32,
+    )
+    cu_seqlens = torch.tensor([0, 3, total_tokens], dtype=torch.int32)
+
+    output, final_state = AscendGatedDeltaNetAttention._chunk_gated_delta_rule_fused(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        cu_seqlens,
+        head_dim**-0.5,
+    )
+
+    assert output.shape == value.shape
+    assert final_state.shape == initial_state.shape
+    assert captured["query"].shape == query.shape[1:]
+    assert captured["key"].shape == key.shape[1:]
+    assert captured["value"].shape == value.shape[1:]
+    assert captured["beta"].dtype == torch.bfloat16
+    assert captured["g"].dtype == torch.float32
+    assert captured["initial_state"].dtype == torch.bfloat16
+    assert torch.equal(captured["actual_seq_lengths"], torch.tensor([3, 4], dtype=torch.int32))
+
+
+def test_fused_chunk_probe_falls_back_when_op_is_unavailable(monkeypatch):
+    monkeypatch.setattr(AscendGatedDeltaNetAttention, "_fused_chunk_available", None)
+    monkeypatch.delattr(ascend_gdn.torch_npu, "npu_chunk_gated_delta_rule")
+
+    assert not AscendGatedDeltaNetAttention._probe_fused_chunk()
+    assert AscendGatedDeltaNetAttention._fused_chunk_available is False
 
 
 def test_sequence_index_buffers_cover_spec_decode_when_cudagraph_disabled():
