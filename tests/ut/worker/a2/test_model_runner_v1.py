@@ -607,6 +607,46 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
         with self.assertRaises(AssertionError):
             runner._correct_optimistic_seq_lens_cpu(1)
 
+    def test_ensure_corrects_only_once(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._seq_lens_cpu_correction_pending = True
+        runner._correct_optimistic_seq_lens_cpu = MagicMock()
+
+        self.assertTrue(runner._ensure_seq_lens_cpu_corrected(3))
+        self.assertFalse(runner._ensure_seq_lens_cpu_corrected(3))
+
+        runner._correct_optimistic_seq_lens_cpu.assert_called_once_with(3)
+        self.assertFalse(runner._seq_lens_cpu_correction_pending)
+
+
+class TestDeferredSeqLensMetadataBuildOrder(unittest.TestCase):
+
+    def test_gdn_builders_are_stably_moved_before_exact_consumers(self):
+        class GDNBuilder:
+            pass
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.GDNAttentionMetadataBuilder",
+            GDNBuilder,
+        ):
+            exact_0 = object()
+            gdn_0 = GDNBuilder()
+            exact_1 = object()
+            gdn_1 = GDNBuilder()
+            builders = [exact_0, gdn_0, exact_1, gdn_1]
+            runner = NPUModelRunner.__new__(NPUModelRunner)
+            runner.attn_groups = [[
+                SimpleNamespace(get_metadata_builder=lambda _ubid, b=b: b)
+                for b in builders
+            ]]
+
+            self.assertEqual(
+                runner._get_attn_group_build_order(0, True), [1, 3, 0, 2]
+            )
+            self.assertEqual(
+                runner._get_attn_group_build_order(0, False), [0, 1, 2, 3]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -485,14 +485,14 @@ class NPUModelRunner(GPUModelRunner):
         # Backends that consume CPU seq_lens (AscendAttentionBackend,
         # AscendMLABackend, and DSV4 compressed attention metadata) need
         # ``optimistic_seq_lens_cpu`` to match the corrected GPU seq_lens
-        # in async spec decode mode; others (SFA, GDN, etc.) do not.
+        # in async spec decode mode; GDN does not.
         self._needs_seq_lens_cpu_sync = self.use_compress or issubclass(
             self.attn_backend, (AscendAttentionBackend, AscendMLABackend)
         )
         # Set by _prepare_inputs when optimistic_seq_lens_cpu still needs the
         # async spec-decode correction; consumed (and cleared) by
-        # _build_attention_metadata just before the first builder that
-        # consumes CPU seq_lens.
+        # _build_attention_metadata just before the first metadata consumer
+        # that needs exact CPU seq_lens.
         self._seq_lens_cpu_correction_pending = False
 
         # kv role
@@ -1312,7 +1312,8 @@ class NPUModelRunner(GPUModelRunner):
             and prev_req_id_to_index
         )
         self._seq_lens_cpu_correction_pending = bool(
-            self._needs_seq_lens_cpu_sync and async_spec_decode_active
+            (self._needs_seq_lens_cpu_sync or self.use_cp)
+            and async_spec_decode_active
         )
 
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
@@ -1676,6 +1677,20 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_cpu.numpy(),
             num_reqs,
         )
+
+    def _ensure_seq_lens_cpu_corrected(self, num_reqs: int) -> bool:
+        """Correct the host seq_lens once, at their first exact consumer.
+
+        Returns whether this call performed the correction. Keeping the
+        pending-state transition next to the event wait makes the operation
+        idempotent for metadata paths with more than one CPU seq_lens
+        consumer.
+        """
+        if not self._seq_lens_cpu_correction_pending:
+            return False
+        self._correct_optimistic_seq_lens_cpu(num_reqs)
+        self._seq_lens_cpu_correction_pending = False
+        return True
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -3082,6 +3097,20 @@ class NPUModelRunner(GPUModelRunner):
                 return True
         return False
 
+    def _get_attn_group_build_order(
+        self, kv_cache_gid: int, defer_seq_lens_correction: bool
+    ) -> list[int]:
+        """Put GPU-only GDN builders before exact CPU seq_lens consumers."""
+        attn_gids = list(range(len(self.attn_groups[kv_cache_gid])))
+        if defer_seq_lens_correction:
+            attn_gids.sort(
+                key=lambda gid: not isinstance(
+                    self.attn_groups[kv_cache_gid][gid].get_metadata_builder(0),
+                    GDNAttentionMetadataBuilder,
+                )
+            )
+        return attn_gids
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -3194,6 +3223,13 @@ class NPUModelRunner(GPUModelRunner):
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        # PCP metadata derives decode context lengths and speculative masks
+        # from the CPU seq_lens. It is constructed before the attention
+        # builders, so it is the first exact consumer when CP is enabled.
+        if self.use_cp and self._ensure_seq_lens_cpu_corrected(num_reqs):
+            max_seq_len = int(
+                self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max()
+            )
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
@@ -3331,7 +3367,9 @@ class NPUModelRunner(GPUModelRunner):
         # builders do not consume CPU seq_lens (e.g. GDN) are built first so
         # their construction overlaps with the previous step's GPU
         # execution; the correction (and its event wait) runs only just
-        # before the first group that actually needs exact values.
+        # before the first builder that actually needs exact values. Both KV
+        # cache groups and builders within a mixed group are ordered with GDN
+        # first to maximize the overlap window.
         defer_seq_lens_correction = (
             not for_cudagraph_capture and self._seq_lens_cpu_correction_pending
         )
@@ -3341,15 +3379,6 @@ class NPUModelRunner(GPUModelRunner):
                 key=lambda gid: self._kv_cache_group_needs_seq_lens_cpu(gid)
             )
         for kv_cache_gid in kv_cache_gids:
-            if defer_seq_lens_correction and self._kv_cache_group_needs_seq_lens_cpu(
-                kv_cache_gid
-            ):
-                self._correct_optimistic_seq_lens_cpu(num_reqs)
-                cm_base.max_seq_len = int(
-                    self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max()
-                )
-                defer_seq_lens_correction = False
-                self._seq_lens_cpu_correction_pending = False
             kv_cache_group = self.kv_cache_config.kv_cache_groups[kv_cache_gid]
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -3392,8 +3421,29 @@ class NPUModelRunner(GPUModelRunner):
                     spec_decode_common_attn_metadata = cm
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
+                if self._ensure_seq_lens_cpu_corrected(num_reqs):
+                    corrected_max_seq_len = int(
+                        self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max()
+                    )
+                    cm_base.max_seq_len = corrected_max_seq_len
+                    cm.max_seq_len = corrected_max_seq_len
+                    defer_seq_lens_correction = False
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
-            for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
+            attn_gids = self._get_attn_group_build_order(
+                kv_cache_gid, defer_seq_lens_correction
+            )
+            for attn_gid in attn_gids:
+                builder = self.attn_groups[kv_cache_gid][attn_gid].get_metadata_builder(0)
+                if (
+                    not isinstance(builder, GDNAttentionMetadataBuilder)
+                    and self._ensure_seq_lens_cpu_corrected(num_reqs)
+                ):
+                    corrected_max_seq_len = int(
+                        self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max()
+                    )
+                    cm_base.max_seq_len = corrected_max_seq_len
+                    cm.max_seq_len = corrected_max_seq_len
+                    defer_seq_lens_correction = False
                 _build_attn_group_metadata(
                     kv_cache_gid,
                     attn_gid,
