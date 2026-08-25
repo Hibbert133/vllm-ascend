@@ -55,3 +55,11 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_fused_moe  # noqa
     import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+# Mamba align APC: patch Scheduler / FullAttentionManager, which live in the
+# EngineCore process. patch/worker is only imported in TP worker processes,
+# so these must be applied here (global patch, runs in APIServer/EngineCore
+# via plugin entry points and NPUPlatform.pre_register_and_update).
+if int(os.getenv("ALIGN_MAMBA_PREFIX_CACHING_LENGTH", "0")) > 0:
+    import vllm_ascend.patch.platform.patch_scheduler  # noqa
+    import vllm_ascend.patch.platform.patch_single_type_kv_cache_manager  # noqa

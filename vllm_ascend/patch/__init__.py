@@ -457,13 +457,13 @@
 # ** 15. File: platform/patch_kv_cache_coordinator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_coordinator.HybridKVCacheCoordinator.find_longest_cache_hit_per_group`
-#    Why:
+#     Why:
 #       In PD disaggregation with hybrid Mamba models, the D side receives
 #       FullAttention KV blocks from the P side but has no local prefix-cache
 #       hit for Mamba groups. Upstream's min-reduction across all KV groups
 #       collapses the FullAttention hit length to 0, preventing partial
 #       FullAttention-only prefix cache reuse on the D side.
-#    How:
+#     How:
 #       For Mamba hybrid models,
 #       num_new_local_computed_tokens should be the FA hit
 #       length. This value is passed to the connector's
@@ -471,12 +471,48 @@
 #       external = total - local_computed.
 #       Using the FA hit skips re-transferring FA blocks
 #       already cached on D-side.
-#    Related PR (if no, explain why):
+#     Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/pull/42524
 #       https://github.com/vllm-project/vllm/pull/44243
-#    Future Plan:
+#     Future Plan:
 #       Remove this patch when vLLM PR #42524 and #44243 is included in the supported
 #       upstream vLLM version.
+#
+# ** 16. File: platform/patch_scheduler.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler._mamba_block_aligned_split`
+#     Why:
+#       Fine-grained Mamba align APC: cap the block-aligned cacheable prefix
+#       at ALIGN_MAMBA_PREFIX_CACHING_LENGTH (block-aligned) so the Mamba
+#       state snapshot boundary can be bounded. The Scheduler runs in the
+#       EngineCore process, so this patch must be a platform (global) patch;
+#       patch/worker is only imported in TP worker processes.
+#     How:
+#       Monkey-patch `_mamba_block_aligned_split` to clamp
+#       `last_cache_position` to the configured length. Enabled only when
+#       ALIGN_MAMBA_PREFIX_CACHING_LENGTH > 0.
+#     Related PR (if no, explain why):
+#       No, vllm-ascend specific APC tuning for hybrid Mamba models.
+#     Future Plan:
+#       Upstream the configurable cacheable-prefix cap once validated.
+#
+# ** 17. File: platform/patch_single_type_kv_cache_manager.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.single_type_kv_cache_manager.FullAttentionManager.find_longest_cache_hit`
+#     Why:
+#       With MTP/EAGLE, upstream unconditionally drops the last matched
+#       block of a full prefix hit, which wastes an entire block of cache
+#       when the spec tokens would not overlap a new block. The manager runs
+#       in the EngineCore process, so this must be a platform (global) patch.
+#     How:
+#       Only drop the last matched block when `num_spec_tokens` is unset/0 or
+#       the prompt remainder is shorter than the spec token count. Requires
+#       `num_spec_tokens` propagated onto FullAttentionSpec by the worker-side
+#       patch_model_executor_attention.py.
+#     Related PR (if no, explain why):
+#       No, optimizes the APC/MTP interaction on Ascend.
+#     Future Plan:
+#       Upstream the num_spec_tokens-aware eagle block drop.
 #
 # * Worker Patch:
 # ===============

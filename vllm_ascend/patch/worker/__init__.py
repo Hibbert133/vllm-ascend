@@ -87,3 +87,13 @@ if _V2_MODEL_RUNNER_SUPPORTED:
 # only patch routed experts capture in main2main.
 if _V2_MODEL_RUNNER_SUPPORTED:
     import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa
+
+from vllm_ascend import envs as ascend_envs
+
+# Mamba align APC: only the model-runner-side patches belong here (they run
+# in TP worker processes). The EngineCore-side patches
+# (patch_scheduler / patch_single_type_kv_cache_manager) live in
+# patch/platform so they are also applied in the EngineCore process.
+if ascend_envs.ALIGN_MAMBA_PREFIX_CACHING_LENGTH > 0:
+    import vllm_ascend.patch.worker.patch_kv_cache_interface
+    import vllm_ascend.patch.worker.patch_model_executor_attention
