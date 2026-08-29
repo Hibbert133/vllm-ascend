@@ -179,6 +179,42 @@ def _matmul_and_reduce_impl_fake(input_parallel: torch.Tensor, layer_name: str) 
     return output
 
 
+def _quantized_matmul_and_reduce_impl(
+    input_parallel: torch.Tensor,
+    pertoken_scale: torch.Tensor,
+    layer_name: str,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    assert self.custom_op is not None
+    bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+    return self.custom_op.quantized_matmul_and_reduce(input_parallel, pertoken_scale, bias_, output_dtype)
+
+
+def _quantized_matmul_and_reduce_impl_fake(
+    input_parallel: torch.Tensor,
+    pertoken_scale: torch.Tensor,
+    layer_name: str,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    num_tokens = input_parallel.size(0)
+    if _EXTRA_CTX.flash_comm_v1_enabled:
+        num_tokens = num_tokens // get_tensor_model_parallel_world_size()
+    try:
+        forward_context = get_forward_context()
+        output_size = forward_context.no_compile_layers[layer_name].output_size_per_partition
+    except AssertionError:
+        # Pattern registration runs without a model forward context. Its example
+        # uses equal hidden and intermediate sizes, so this fallback is exact.
+        output_size = input_parallel.size(-1)
+    return torch.empty(
+        size=(num_tokens, output_size),
+        device=input_parallel.device,
+        dtype=output_dtype,
+    )
+
+
 # TODO(Angazenn): The reason why we use a custom op to encapsulate npu_quantize
 # is that aclnnAscendQuantV3(npu_quantize) use div_mode=False, while
 # aclnnAddRmsNormQuantV2(npu_add_rms_norm_quant) use div_moe=True. We have to
@@ -269,6 +305,14 @@ direct_register_custom_op(
     op_name="matmul_and_reduce",
     op_func=_matmul_and_reduce_impl,
     fake_impl=_matmul_and_reduce_impl_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="quantized_matmul_and_reduce",
+    op_func=_quantized_matmul_and_reduce_impl,
+    fake_impl=_quantized_matmul_and_reduce_impl_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

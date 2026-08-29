@@ -56,6 +56,11 @@ class GraphFusionPassManager:
 
             self.passes.append(AddRMSNormQuantFusionPass(config))
 
+        if config.compilation_config.pass_config.fuse_act_quant and not is_310p():
+            from .passes.swiglu_quant_fusion_pass import SwiGLUQuantFusionPass
+
+            self.passes.append(SwiGLUQuantFusionPass(config))
+
         if self.ascend_compilation_config.get("fuse_qknorm_rope", True):
             from .passes.qknorm_rope_fusion_pass import QKNormRopeFusionPass
 

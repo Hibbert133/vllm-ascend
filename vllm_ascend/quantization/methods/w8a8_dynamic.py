@@ -86,6 +86,27 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             quantized_x = quantized_x.squeeze(dim=1)
             pertoken_scale = pertoken_scale.squeeze(dim=1)
 
+        output = self.apply_quantized(
+            layer,
+            quantized_x,
+            pertoken_scale,
+            bias=bias,
+            output_dtype=x.dtype,
+        )
+        if need_unsqz:
+            output = output.unsqueeze(dim=1)
+        return output
+
+    def apply_quantized(
+        self,
+        layer: torch.nn.Module,
+        quantized_x: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """Apply the linear projection to an already dynamically quantized input."""
+
         chunk_size = getattr(layer, "_chunk_size", 0)
         if isinstance(chunk_size, int) and chunk_size > 0:
             bias_1 = bias[:chunk_size] if bias is not None else None
@@ -98,7 +119,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
                         layer.weight_1_scale,
                         pertoken_scale=pertoken_scale,
                         bias=bias_1,
-                        output_dtype=x.dtype,
+                        output_dtype=output_dtype,
                     ),
                     torch_npu.npu_quant_matmul(
                         quantized_x,
@@ -106,7 +127,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
                         layer.weight_2_scale,
                         pertoken_scale=pertoken_scale,
                         bias=bias_2,
-                        output_dtype=x.dtype,
+                        output_dtype=output_dtype,
                     ),
                 ],
                 dim=-1,
@@ -118,10 +139,8 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
                 layer.weight_scale,
                 pertoken_scale=pertoken_scale,
                 bias=bias if self.act_quant_type == torch.int8 else None,
-                output_dtype=x.dtype,
+                output_dtype=output_dtype,
             )
-        if need_unsqz:
-            output = output.unsqueeze(dim=1)
         return output
 
     def process_weights_after_loading(self, layer):

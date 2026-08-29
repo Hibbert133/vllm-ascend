@@ -233,6 +233,39 @@ class TestModelSPWithBias(nn.Module):
         return [torch.ops.npu.npu_add_rms_norm_quant.default, torch.ops.vllm.maybe_all_gather_and_maybe_unpad.default]
 
 
+class TestDynamicQuantModelWithoutBias(nn.Module):
+    """Reproduce Qwen3's custom AddRMSNorm -> DynamicQuant graph."""
+
+    def __init__(self, hidden_size: int, dtype: torch.dtype, eps: float, sp_enable: bool, device="npu"):
+        super().__init__()
+        self.eps = eps
+        self.sp_enable = sp_enable
+        self.rms_norm_weight = nn.Parameter(torch.randn(hidden_size, dtype=dtype, device=device))
+
+    def forward(self, x):
+        residual = torch.zeros_like(x)
+        norm_output, _, new_residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
+            x, residual, self.rms_norm_weight, None, self.eps
+        )
+        if self.sp_enable:
+            norm_output = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(norm_output, True)
+        quantized_output, per_token_scale = torch.ops.npu.npu_dynamic_quant(norm_output)
+        return quantized_output, per_token_scale, new_residual
+
+    def ops_in_model_before(self) -> list[OpOverload]:
+        ops = [torch.ops._C_ascend.npu_add_rms_norm_bias.default]
+        if self.sp_enable:
+            ops.append(torch.ops.vllm.maybe_all_gather_and_maybe_unpad.default)
+        ops.append(torch.ops.npu.npu_dynamic_quant.default)
+        return ops
+
+    def ops_in_model_after(self) -> list[OpOverload]:
+        ops = [torch.ops.npu.npu_add_rms_norm_dynamic_quant.default]
+        if self.sp_enable:
+            ops.extend([torch.ops.vllm.maybe_all_gather_and_maybe_unpad.default] * 2)
+        return ops
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [64])
 @pytest.mark.parametrize("num_tokens", [257])
@@ -294,5 +327,25 @@ def test_rmsnorm_quant_fusion(
         print("Fused result:", [t.shape for t in result_fused])
 
         print("=== Checking operator fusion ===")
+        backend.check_before_ops(model.ops_in_model_before(), fully_replaced=not sp_enable)
+        backend.check_after_ops(model.ops_in_model_after())
+
+
+@pytest.mark.parametrize("eps", [1e-5, 1e-6])
+@pytest.mark.parametrize("sp_enable", [False, True])
+def test_custom_addrmsnorm_dynamic_quant_fusion(eps: float, sp_enable: bool):
+    """The bias-free custom op used by Qwen3 must fuse with DynamicQuant."""
+    dtype = torch.bfloat16
+    vllm_config = VllmConfig(model_config=ModelConfig(dtype=dtype))
+
+    with vllm.config.set_current_vllm_config(vllm_config), set_ascend_forward_context(None, vllm_config):
+        backend = get_or_create_backend(vllm_config)
+        model = TestDynamicQuantModelWithoutBias(64, dtype, eps, sp_enable).to("npu")
+        x = torch.rand(257, 64, device="npu", dtype=dtype, requires_grad=False)
+
+        result_unfused = model(x)
+        result_fused = torch.compile(model, backend=backend)(x)
+
+        assert len(result_unfused) == len(result_fused) == 3
         backend.check_before_ops(model.ops_in_model_before(), fully_replaced=not sp_enable)
         backend.check_after_ops(model.ops_in_model_after())

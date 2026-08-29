@@ -612,6 +612,47 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         return output
 
+    def quantized_matmul_and_reduce(
+        self,
+        input_parallel: torch.Tensor,
+        pertoken_scale: torch.Tensor,
+        bias_: Parameter | None,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run a W8A8 down projection without quantizing its input again."""
+        from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+        from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+
+        linear_method = self.layer.quant_method
+        quant_method = (
+            linear_method.quant_method if isinstance(linear_method, AscendLinearMethod) else linear_method
+        )
+        if not isinstance(quant_method, AscendW8A8DynamicLinearMethod):
+            raise TypeError("Pre-quantized matmul_and_reduce requires W8A8_DYNAMIC")
+
+        try:
+            flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled
+        except AssertionError:
+            flash_comm_v1_enabled = False
+
+        if flash_comm_v1_enabled:
+            pad_size = _EXTRA_CTX.pad_size
+            if pad_size > 0:
+                input_parallel = F.pad(input_parallel, (0, 0, 0, pad_size))
+                scale_padding = pertoken_scale.new_zeros((pad_size, *pertoken_scale.shape[1:]))
+                pertoken_scale = torch.cat((pertoken_scale, scale_padding), dim=0)
+
+        output_parallel = quant_method.apply_quantized(
+            self.layer,
+            input_parallel,
+            pertoken_scale,
+            bias=bias_,
+            output_dtype=output_dtype,
+        )
+        if flash_comm_v1_enabled:
+            return tensor_model_parallel_reduce_scatter(output_parallel, 0)
+        return tensor_model_parallel_all_reduce(output_parallel)
+
     def update_attrs(self):
         super().update_attrs()
         self.input_is_parallel = self.layer.input_is_parallel
